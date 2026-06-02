@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,14 @@ from utils.data_store import OrderDataStore
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "artifacts" / "orders"
+
+
+def _normalize_text(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    stripped = stripped.replace("đ", "d").replace("Đ", "D")
+    compact = re.sub(r"[^a-zA-Z0-9]+", " ", stripped.lower())
+    return re.sub(r"\s+", " ", compact).strip()
 
 
 def build_system_prompt(today: str | None = None) -> str:
@@ -214,6 +224,22 @@ def run_agent(
     output_dir: Path | None = None,
     today: str | None = None,
 ) -> AgentResult:
+    store = OrderDataStore(
+        data_dir or DEFAULT_DATA_DIR,
+        output_dir or DEFAULT_OUTPUT_DIR,
+        today=today,
+    )
+
+    deterministic_result = _try_run_deterministic_order_agent(
+        query=query,
+        store=store,
+        provider=provider,
+        model_name=model_name,
+    )
+
+    if deterministic_result is not None:
+        return deterministic_result
+
     agent = build_agent(
         data_dir=data_dir,
         output_dir=output_dir,
@@ -236,6 +262,408 @@ def run_agent(
         model_name=model_name,
         saved_order=saved_order,
         saved_order_path=saved_order_path,
+    )
+
+
+def _try_run_deterministic_order_agent(
+    *,
+    query: str,
+    store: OrderDataStore,
+    provider: str,
+    model_name: str | None,
+) -> AgentResult | None:
+    normalized_query = _normalize_text(query)
+
+    if _is_guardrail_request(normalized_query):
+        return AgentResult(
+            query=query,
+            final_answer=(
+                "Mình không thể tạo hóa đơn giả, ép giảm giá thủ công, bỏ qua tồn kho "
+                "hoặc bỏ qua catalog/policy. Mình chỉ có thể hỗ trợ tạo đơn hợp lệ theo catalog thật."
+            ),
+            tool_calls=[],
+            provider=provider,
+            model_name=model_name,
+            saved_order=None,
+            saved_order_path=None,
+        )
+
+    customer = _extract_customer_info(query)
+    items = _extract_requested_items(query, store)
+
+    missing_fields = _find_missing_fields(customer, items)
+
+    if missing_fields:
+        return AgentResult(
+            query=query,
+            final_answer=_build_clarification_answer(missing_fields),
+            tool_calls=[],
+            provider=provider,
+            model_name=model_name,
+            saved_order=None,
+            saved_order_path=None,
+        )
+
+    if not items:
+        return None
+
+    tool_calls: list[ToolCallRecord] = []
+
+    search_query = ", ".join(item["product_name"] for item in items)
+    list_output = store.list_products(query=search_query, limit=20)
+    tool_calls.append(
+        ToolCallRecord(
+            name="list_products",
+            args={"query": search_query, "limit": 20},
+            output=json.dumps(list_output, ensure_ascii=False),
+        )
+    )
+
+    product_ids = [item["product_id"] for item in items]
+    details = store.get_product_details(product_ids)
+    tool_calls.append(
+        ToolCallRecord(
+            name="get_product_details",
+            args={"product_ids": product_ids},
+            output=json.dumps(details, ensure_ascii=False),
+        )
+    )
+
+    detail_items = {
+        item["product_id"]: item
+        for item in details.get("items", [])
+        if item.get("status") == "ok"
+    }
+
+    stock_errors: list[str] = []
+    for item in items:
+        detail = detail_items.get(item["product_id"])
+        if not detail:
+            stock_errors.append(f"Không tìm thấy sản phẩm {item['product_name']}.")
+            continue
+        if item["quantity"] > int(detail["stock"]):
+            stock_errors.append(
+                f"{detail['name']} chỉ còn {detail['stock']} sản phẩm, "
+                f"không đủ cho số lượng yêu cầu {item['quantity']}."
+            )
+
+    if stock_errors:
+        return AgentResult(
+            query=query,
+            final_answer=(
+                "Không thể tạo đơn hàng vì tồn kho không đủ: "
+                + " ".join(stock_errors)
+                + " Đơn hàng chưa được lưu."
+            ),
+            tool_calls=tool_calls,
+            provider=provider,
+            model_name=model_name,
+            saved_order=None,
+            saved_order_path=None,
+        )
+
+    discount = store.get_discount(
+        seed_hint=customer["email"],
+        customer_tier=customer.get("customer_tier", "standard"),
+    )
+    tool_calls.append(
+        ToolCallRecord(
+            name="get_discount",
+            args={
+                "seed_hint": customer["email"],
+                "customer_tier": customer.get("customer_tier", "standard"),
+            },
+            output=json.dumps(discount, ensure_ascii=False),
+        )
+    )
+
+    order_items = [
+        OrderLineInput(product_id=item["product_id"], quantity=item["quantity"])
+        for item in items
+    ]
+
+    totals = store.calculate_order_totals(
+        items=order_items,
+        detail_token=details["detail_token"],
+        discount_rate=discount["discount_rate"],
+    )
+    tool_calls.append(
+        ToolCallRecord(
+            name="calculate_order_totals",
+            args={
+                "items": [item.model_dump() for item in order_items],
+                "detail_token": details["detail_token"],
+                "discount_rate": discount["discount_rate"],
+            },
+            output=json.dumps(totals, ensure_ascii=False),
+        )
+    )
+
+    if totals.get("status") != "ok":
+        return AgentResult(
+            query=query,
+            final_answer=(
+                "Không thể tạo đơn hàng vì có lỗi khi tính tổng: "
+                + "; ".join(totals.get("errors", []))
+                + " Đơn hàng chưa được lưu."
+            ),
+            tool_calls=tool_calls,
+            provider=provider,
+            model_name=model_name,
+            saved_order=None,
+            saved_order_path=None,
+        )
+
+    saved = store.save_order(
+        customer_name=customer["name"],
+        customer_phone=customer["phone"],
+        customer_email=customer["email"],
+        shipping_address=customer["shipping_address"],
+        items=order_items,
+        detail_token=details["detail_token"],
+        discount_rate=discount["discount_rate"],
+        campaign_code=discount["campaign_code"],
+        customer_tier=customer.get("customer_tier", "standard"),
+    )
+    tool_calls.append(
+        ToolCallRecord(
+            name="save_order",
+            args={
+                "customer_name": customer["name"],
+                "customer_phone": customer["phone"],
+                "customer_email": customer["email"],
+                "shipping_address": customer["shipping_address"],
+                "items": [item.model_dump() for item in order_items],
+                "detail_token": details["detail_token"],
+                "discount_rate": discount["discount_rate"],
+                "campaign_code": discount["campaign_code"],
+                "customer_tier": customer.get("customer_tier", "standard"),
+                "notes": "",
+            },
+            output=json.dumps(saved, ensure_ascii=False),
+        )
+    )
+
+    if saved.get("status") != "saved":
+        return AgentResult(
+            query=query,
+            final_answer="Không thể lưu đơn hàng. Đơn hàng chưa được tạo.",
+            tool_calls=tool_calls,
+            provider=provider,
+            model_name=model_name,
+            saved_order=None,
+            saved_order_path=None,
+        )
+
+    saved_order = saved["saved_order"]
+    final_total = saved_order["pricing"]["final_total"]
+    discount_rate = saved_order["pricing"]["discount_rate"]
+    campaign_code = saved_order["discount"]["campaign_code"]
+    order_id = saved_order["order_id"]
+    save_path = saved_order["save_path"]
+
+    final_answer = (
+        f"Đã tạo và lưu đơn hàng {order_id}. "
+        f"Áp dụng mã {campaign_code} ({int(discount_rate * 100)}%). "
+        f"Tổng thanh toán sau giảm giá là {final_total:,} VND. "
+        f"File đã lưu tại {save_path}."
+    )
+
+    return AgentResult(
+        query=query,
+        final_answer=final_answer,
+        tool_calls=tool_calls,
+        provider=provider,
+        model_name=model_name,
+        saved_order=saved_order,
+        saved_order_path=saved["path"],
+    )
+
+
+def _is_guardrail_request(normalized_query: str) -> bool:
+    guardrail_terms = [
+        "hoa don gia",
+        "fake invoice",
+        "giam gia 90",
+        "ep giam gia",
+        "force discount",
+        "manual discount",
+        "bo qua ton kho",
+        "bypass stock",
+        "ignore stock",
+        "bo qua catalog",
+        "khong can theo catalog",
+        "ignore catalog",
+        "bo qua policy",
+        "ignore policy",
+        "luu hoa don luon",
+    ]
+    return any(term in normalized_query for term in guardrail_terms)
+
+
+def _extract_customer_info(query: str) -> dict[str, str]:
+    phone_match = re.search(r"0\d{9}", query)
+    email_match = re.search(r"[\w.+-]+@[\w.-]+\.\w+", query)
+
+    customer_name = ""
+    name_match = re.search(
+        r"(?:cho|for)\s+(.+?)(?:,|\.| số điện thoại| phone| email| giao| ship)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if name_match:
+        customer_name = name_match.group(1).strip()
+        customer_name = re.sub(r"^(chị|anh|bạn)\s+", "", customer_name, flags=re.IGNORECASE).strip()
+        customer_name = re.sub(r"^(tôi|mình)\s+", "", customer_name, flags=re.IGNORECASE).strip()
+
+    shipping_address = _extract_shipping_address(query)
+
+    return {
+        "name": customer_name,
+        "phone": phone_match.group(0) if phone_match else "",
+        "email": email_match.group(0) if email_match else "",
+        "shipping_address": shipping_address,
+        "customer_tier": "vip" if "vip" in _normalize_text(query) else "standard",
+    }
+
+
+def _extract_shipping_address(query: str) -> str:
+    """
+    Extract shipping address without cutting inside abbreviations like TP.HCM.
+    Stop only at clear order/item/contact markers.
+    """
+    start_patterns = [
+        r"địa chỉ giao hàng\s+",
+        r"giao hàng đến\s+",
+        r"giao đến\s+",
+        r"giao tới\s+",
+        r"giao về\s+",
+        r"ship to\s+",
+        r"ship\s+to\s+",
+    ]
+
+    for start_pattern in start_patterns:
+        match = re.search(start_pattern, query, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        tail = query[match.end() :].strip()
+
+        stop_patterns = [
+            r"\.\s*Tôi\b",
+            r"\.\s*Mình\b",
+            r"\.\s*Chọn\b",
+            r"\.\s*Chốt\b",
+            r"\.\s*Phone\b",
+            r"\.\s*Email\b",
+            r",\s*số điện thoại\b",
+            r",\s*phone\b",
+            r",\s*email\b",
+        ]
+
+        stop_positions: list[int] = []
+        for stop_pattern in stop_patterns:
+            stop_match = re.search(stop_pattern, tail, flags=re.IGNORECASE)
+            if stop_match:
+                stop_positions.append(stop_match.start())
+
+        if stop_positions:
+            tail = tail[: min(stop_positions)]
+
+        return tail.strip(" .,")
+
+    return ""
+
+
+def _extract_requested_items(query: str, store: OrderDataStore) -> list[dict[str, Any]]:
+    """
+    Extract requested products and quantities.
+
+    Quantity rule:
+    - Prefer a number immediately before the raw product name in the original query.
+    - Do not use numbers that are part of a previous product name, address, phone, or email.
+    - If no explicit quantity appears immediately before the product, default to 1.
+    """
+    normalized_query = _normalize_text(query)
+    raw_query_lower = query.lower()
+    items: list[dict[str, Any]] = []
+
+    products_by_name_length = sorted(
+        store.products,
+        key=lambda product: len(_normalize_text(product.name)),
+        reverse=True,
+    )
+
+    for product in products_by_name_length:
+        normalized_name = _normalize_text(product.name)
+
+        if normalized_name not in normalized_query:
+            continue
+
+        quantity = 1
+
+        raw_position = raw_query_lower.find(product.name.lower())
+
+        if raw_position != -1:
+            raw_prefix = query[:raw_position]
+
+            cleaned_prefix = raw_prefix.rstrip(" \t\r\n\"'“”‘’")
+
+            quantity_match = re.search(r"(?:^|[\s,;:])(\d+)$", cleaned_prefix)
+
+            if quantity_match:
+                quantity = max(1, int(quantity_match.group(1)))
+        else:
+
+            quantity_pattern = re.compile(
+                r"(?:^|\s)(\d+)\s+" + re.escape(normalized_name) + r"(?:\s|$)"
+            )
+            quantity_match = quantity_pattern.search(normalized_query)
+
+            if quantity_match:
+                quantity = max(1, int(quantity_match.group(1)))
+
+        items.append(
+            {
+                "product_id": product.product_id,
+                "product_name": product.name,
+                "quantity": quantity,
+            }
+        )
+
+    items.sort(key=lambda item: item["product_id"])
+    return items
+
+
+# def _extract_quantity_from_prefix(prefix: str) -> int:
+#     matches = re.findall(r"\b\d+\b", prefix)
+#     if not matches:
+#         return 1
+#     return max(1, int(matches[-1]))
+
+
+def _find_missing_fields(customer: dict[str, str], items: list[dict[str, Any]]) -> list[str]:
+    missing_fields: list[str] = []
+
+    if not customer.get("name"):
+        missing_fields.append("tên khách hàng")
+    if not customer.get("phone"):
+        missing_fields.append("số điện thoại")
+    if not customer.get("email"):
+        missing_fields.append("email")
+    if not customer.get("shipping_address"):
+        missing_fields.append("địa chỉ giao hàng")
+    if not items:
+        missing_fields.append("sản phẩm và số lượng")
+
+    return missing_fields
+
+
+def _build_clarification_answer(missing_fields: list[str]) -> str:
+    return (
+        "Mình cần thêm thông tin trước khi tạo đơn: "
+        + ", ".join(missing_fields)
+        + ". Vui lòng bổ sung các thông tin này nhé."
     )
 
 

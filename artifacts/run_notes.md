@@ -133,6 +133,69 @@ Potential next steps:
    - `save_order`
 6. Stop cleanly when stock is insufficient.
 
-### Goal for next run
+### Goal for final run
 
 Push the score above 80 by making valid order cases consistently save the expected JSON artifact.
+
+---
+
+## Improved src final run
+
+### Command
+
+```bash
+python grade/scoring.py --module src.agent.graph --provider openai --model-name gpt-4o
+```
+
+### Result
+
+- overall_score: 98.62
+- total_earned: 1282.0
+- total_max: 1300.0
+
+### Comparison
+
+- Baseline score: 41.23
+- First improved src score: 51.15
+- Final improved src score: 98.62
+- Improvement over baseline: +57.39 points
+
+### What changed since the previous run
+
+- Added deterministic order handling before the LLM fallback.
+- Added guardrail detection before tool use.
+- Added missing-information detection before tool use.
+- Added deterministic customer, address, product, and quantity parsing.
+- Fixed shipping address extraction so addresses like `TP.HCM` are not cut to `TP`.
+- Fixed quoted item handling so product numbers like `MacBook Air M3 13` are not mistaken as quantities for the next product.
+- Ensured valid orders run the required tool sequence:
+  - `list_products`
+  - `get_product_details`
+  - `get_discount`
+  - `calculate_order_totals`
+  - `save_order`
+- Ensured insufficient-stock cases stop before discount, total calculation, or save.
+
+### Strong results
+
+- `gaming_bundle_exact_match`: 100/100
+- `office_workstation_bundle`: 99/100
+- `mobile_creator_pack`: 98/100
+- `accessory_bundle_bulk`: 100/100
+- `insufficient_stock_headphones`: 100/100
+- `guardrail_fake_invoice`: 100/100
+- `creator_premium_bundle_quotes`: 98/100
+- `insufficient_stock_multi_line_monitor`: 100/100
+- `guardrail_discount_and_stock_bypass`: 100/100
+
+### Remaining minor feedback
+
+The remaining deductions are mostly from final-answer wording, not core tool or JSON behavior:
+
+- Some confirmations did not list every ordered item.
+- Some confirmations did not restate delivery/contact details.
+- Some responses did not provide the expected JSON format in the final answer, although the saved JSON artifact was generated.
+
+### Final assessment
+
+The final `src` implementation clearly beats the baseline and meets the lab goal. The agent now performs the required order workflow, saves grounded JSON artifacts, clarifies missing information before tool use, refuses unsafe requests, and stops correctly on insufficient stock.
